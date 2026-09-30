@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 _ROOT = Path(__file__).resolve().parents[2]
 
+from server import config  # noqa: E402
 from server.services import wb2api  # noqa: E402
 
 
@@ -310,3 +311,63 @@ class RateLimitedModelsTest(unittest.TestCase):
         seg = seg[:seg.index('\n  }')]
         self.assertIn('if (!limited.length) return null', seg,
                       '没有「无受限模型则不渲染」的保护')
+class GlobalCreditsUnknownTest(unittest.TestCase):
+    """国际版账号的 credits 不能照抄上游的 0（用户报「额度恒为 0」）。
+
+    上游只在**签到流程**里查余额（scheduler.CheckinAll → UserResourceDetailed），
+    而国际版没有签到体系、在查余额之前就被 `a.IsGlobal()` 分支跳过。于是它的
+    credits 永远是池里的初始值 0 —— 这不是「余额为 0」，而是「从没查过」。
+
+    管理端此前把这 0 原样透出，界面就显示成刺眼的红色 0；真实余额（直连
+    www.workbuddy.ai 的 billing 接口可查）其实有几十到上百。现在按「未知」
+    处理（None → 界面显示「—」），真值交给直连刷新接口填。
+    """
+
+    def _merge(self, pool_item: dict, account: dict) -> dict:
+        accounts = [account]
+        wb2api.merge_pool_status(accounts, {'accounts': [dict(pool_item, uid='u1')]})
+        return accounts[0]
+
+    def test_global_zero_is_treated_as_unknown(self) -> None:
+        a = self._merge({'credits': 0}, {'uid': 'u1', 'realm': 'global'})
+        self.assertIsNone(a['credits'], '国际版上游 0 是「没查过」，不该当余额展示')
+
+    def test_global_nonzero_not_trusted_either(self) -> None:
+        """上游对国际版**从不刷新**，任何值都可能是过时/初始值，一律按未知处理。"""
+        a = self._merge({'credits': 123}, {'uid': 'u1', 'realm': 'global'})
+        self.assertIsNone(a['credits'])
+
+    def test_cn_credits_still_passthrough(self) -> None:
+        """国内版签到会真实刷新 credits，必须原样透传（不能误伤）。"""
+        a = self._merge({'credits': 3183}, {'uid': 'u1', 'realm': 'cn'})
+        self.assertEqual(a['credits'], 3183)
+
+    def test_cn_zero_is_kept(self) -> None:
+        """国内版的 0 是真的余额耗尽，要保留（否则积分耗尽看不出来）。"""
+        a = self._merge({'credits': 0}, {'uid': 'u1', 'realm': 'cn'})
+        self.assertEqual(a['credits'], 0)
+
+    def test_legacy_missing_realm_treated_as_cn(self) -> None:
+        """存量账号无 realm 字段时按国内版处理（与 list_auth_accounts 的回退一致）。"""
+        a = self._merge({'credits': 7}, {'uid': 'u1'})
+        self.assertEqual(a['credits'], 7)
+
+
+class TencentConnectTimeoutTest(unittest.TestCase):
+    """腾讯出站必须用一个够长的连接超时（国际版 TLS 握手可达 6 秒）。
+
+    httpx 的 connect 超时**含 TLS 握手**。国际版走 www.workbuddy.ai，在国内
+    网络（经代理/隧道 + fake-ip）下握手实测 5.6~6.2 秒；此前 tencent.py 里
+    11 处写死的 `connect=5` 会让每一次国际版直连都稳定超时（积分刷新即报
+    「查询异常: 」）。本测试锁住这个回归：不许再出现硬编码的 5 秒连接超时。
+    """
+
+    def test_config_exposes_connect_timeout(self) -> None:
+        self.assertGreaterEqual(config.TENCENT_CONNECT_TIMEOUT, 10,
+                                '连接超时至少 10 秒，否则国际版握手会稳定超时')
+
+    def test_tencent_module_uses_config_constant(self) -> None:
+        src = (_ROOT / 'server' / 'services' / 'tencent.py').read_text(encoding='utf-8')
+        self.assertNotIn('connect=5)', src,
+                         'tencent.py 仍有硬编码 connect=5 —— 国际版会超时')
+        self.assertIn('connect=config.TENCENT_CONNECT_TIMEOUT', src)

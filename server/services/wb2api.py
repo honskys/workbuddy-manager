@@ -239,6 +239,17 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
             continue
         credits = p.get('credits')
         a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
+        # 国际版账号的 credits 在上游**恒为 0**，不是"余额为 0"，而是"从没查过"：
+        # 上游只在签到流程里查余额（scheduler.CheckinAll → UserResourceDetailed），
+        # 而国际版没有签到体系、在查余额之前就被 `a.IsGlobal()` 分支跳过；余额只
+        # 在用户真实消耗时被扣减，因此永远是初始值 0。
+        #
+        # 照抄给界面会显示成刺眼的红色 0，与 workbuddy.ai 官网上的真实余额不符
+        # （用户报的现象）。这里按"未知"处理（None → 界面显示「—」），真值交给
+        # 直连腾讯的刷新接口（credits.fetch_credits）填；那边查得到就覆盖成真值，
+        # 查不到也只显示「—」，不会用一个假的 0 误导用户。
+        if str(a.get('realm') or '') == 'global':
+            a['credits'] = None
         a['cooling'] = bool(p.get('cooling'))
         # 冷却剩余秒数：上游状态机给的是权威值（可能是它解析出的「上游重置时刻」，
         # 也可能是无时间文案时的有界退避）。展示出来，用户就知道还要等多久，

@@ -99,7 +99,7 @@ def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
 
 async def start_login(realm: Realm = CN) -> dict:
     """发起扫码登录。realm 决定用哪套端点与 Origin（默认国内版）。"""
-    async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+    async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
         resp = await client.post(
             f'{chat_base(realm)}/v2/plugin/auth/state',
             params={'platform': 'CLI'},
@@ -148,7 +148,7 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
         return {'status': 'realm_mismatch', 'expected': reg_realm, 'got': realm}
     realm = reg_realm
 
-    async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+    async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
         resp = await client.get(
             f'{chat_base(realm)}/v2/plugin/auth/token',
             params={'state': state},
@@ -418,7 +418,7 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
 
     url = f'{chat_base(realm)}/v2/plugin/auth/token/refresh'
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             resp = await client.post(url, headers=headers)
     except Exception as exc:  # noqa: BLE001
         return False, f'刷新异常: {exc}', {}
@@ -477,7 +477,7 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
     if not supports_checkin(realm):
         return -2, '国际版无签到体系，已跳过'
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             resp = await client.post(
                 f'{billing_base(realm)}{billing_paths(realm, "daily-checkin")[0]}',
                 json={},
@@ -536,7 +536,7 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         # 头走 billing 域（带 X-User-Id 等身份头，对齐上游 BillingHeaders）
         hdr = _billing_hdr(realm, auth)
         resp = None
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             for path in billing_paths(realm, 'user-resource'):
                 resp = await client.post(
                     f'{billing_base(realm)}{path}', json=body, headers=hdr
@@ -569,7 +569,11 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         expiries.sort(key=lambda e: e['at'])
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
-        return False, None, f'查询异常: {exc}', []
+        # httpx 的 ConnectTimeout 等异常 str() 为空，只写 {exc} 会得到
+        # 「查询异常: 」这种没有任何线索的文案（用户报「国际版额度恒 0」时
+        # 界面上正是这句）。空文本时补上异常类名，至少能区分超时与其它错误。
+        detail = str(exc).strip() or type(exc).__name__
+        return False, None, f'查询异常: {detail}', []
 
 
 async def fetch_models(auth: dict) -> tuple[bool, list | str]:
@@ -614,7 +618,7 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
         """按候选路径顺序取第一个成功响应，返回 (data, 错误说明)。"""
         last_code = -1
         try:
-            async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+            async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
                 for path in paths:
                     resp = await client.get(
                         f'{chat_base(realm)}{path}',
@@ -956,7 +960,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     # 就是列表、且将来可能再加候选；但**不能**因此以为现在有回落保护 ——
     # 列表只有一个元素时，404/405 会直接走下面的报错分支。
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             for path in chat_paths(realm):
                 async with client.stream(
                     'POST', f'{base}{path}', json=payload, headers=headers,
@@ -1062,7 +1066,7 @@ async def registration_status(auth: dict) -> tuple[bool, str]:
     try:
         # 上游参照实现（scripts/global_region.py activate_region）明确带 X-User-Id，
         # 这里走 billing 域头（含身份头），保持一致
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             resp = await client.get(url, params={'userId': uid}, headers=_billing_hdr(realm, auth))
         code, data = _envelope(resp)
         if code == 200 or code == 0:
@@ -1114,7 +1118,7 @@ async def submit_region(auth: dict, region_code: str) -> tuple[bool, str]:
     }
     body = {'attributes': attrs}
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             resp = await client.post(
                 f'{billing_base(realm)}/console/login/account',
                 json=body,
@@ -1137,7 +1141,7 @@ async def _region_fields(ios2: str) -> tuple[str, str, str]:
     """
     fallback = (ios2, ios2, ios2)
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             resp = await client.post(
                 f'{billing_base(GLOBAL)}/billing/area/get-country-code',
                 json={'filterForbidden': 1},
@@ -1176,7 +1180,7 @@ async def claim_trial(auth: dict) -> tuple[bool, str]:
     if not token:
         return False, '缺少 accessToken'
     try:
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=config.TENCENT_CONNECT_TIMEOUT) as client:
             resp = await client.post(
                 f'{billing_base(realm)}/billing/ide/trial',
                 json={},

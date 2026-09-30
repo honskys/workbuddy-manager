@@ -71,6 +71,20 @@ BASE_PATH = f'/{_BASE_PATH_RAW}' if _BASE_PATH_RAW else ''
 # 网络
 UPSTREAM_TIMEOUT = _env_int('WB_UPSTREAM_TIMEOUT', 120)
 TENCENT_TIMEOUT = _env_int('WB_TENCENT_TIMEOUT', 15)
+
+# 访问腾讯接口时的「连接」超时（秒）。httpx 的 connect 超时**包含 TLS 握手**，
+# 而不只是 TCP 建连。
+#
+# 为什么单独设：国际版 billing/chat 走 www.workbuddy.ai，在国内网络（尤其经
+# 代理/隧道 + fake-ip 路由）下 TLS 握手实测要 5.6~6.2 秒——原先各处写死的 5 秒
+# 会让**每一次**国际版直连查询稳定超时。表现为：积分刷新接口报
+# 「查询异常: 」（ConnectTimeout 的 str 为空），面板只能回落到上游 /status 的
+# 值，而上游对国际版账号从不刷新 credits（见 wb2api.merge_pool_status），
+# 于是国际版额度恒显示 0，与官网真实余额不符。
+#
+# 国内版接口握手 <0.3 秒，抬高这个值只是让断网时的失败判定稍慢，不影响正确性；
+# 总时长仍由 TENCENT_TIMEOUT 兜底。
+TENCENT_CONNECT_TIMEOUT = max(1, _env_int('WB_TENCENT_CONNECT_TIMEOUT', 10))
 # 「全部签到」的并发上限：太低会拖到前端超时（几十个账号时），
 # 太高又容易触发腾讯风控。5 是保守且够快的取值。
 CHECKIN_CONCURRENCY = max(1, _env_int('WB_CHECKIN_CONCURRENCY', 5))
