@@ -22,6 +22,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -152,7 +153,12 @@ class HourlyEndpointTest(_Case):
                                 json={'username': 'admin', 'password': 'p'}).status_code == 200
 
     def test_returns_24_zero_filled_buckets(self) -> None:
-        r = self.client.get('/api/stats/hourly')
+        # 本地无任何流量、且上游也取不到时，仍固定返回 24 个零桶（X 轴不抖动）。
+        # **必须 mock 上游回退**：否则这里会打真实上游，结果随环境变化
+        # （有上游在跑时当前小时会被填上累计值，不再是全零）。
+        from server.routers import stats as stats_mod
+        with mock.patch.object(stats_mod, '_fetch_upstream_stats', return_value=None):
+            r = self.client.get('/api/stats/hourly')
         self.assertEqual(r.status_code, 200, r.text)
         data = r.json()
         self.assertEqual(len(data), 24, '小时桶不是 24 个 —— X 轴会随数据抖动')

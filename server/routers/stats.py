@@ -1,14 +1,130 @@
 """用量统计聚合。"""
 from __future__ import annotations
 
+import logging
 import time
 
+import httpx
 from fastapi import APIRouter, Depends
 
-from .. import db, security
+from .. import config, db, security
 from ..services import wb2api
 
+logger = logging.getLogger('workbuddy.stats')
+
 router = APIRouter(prefix='/api/stats', tags=['stats'])
+
+
+# ── 上游真实用量兜底 ────────────────────────────────────────────────
+#
+# 为什么需要：本模块的所有数字都来自 usage_daily / usage_hourly / request_logs，
+# 而这些表**只**累计经**本管理端网关**（:7864）转发的流量。若客户端直连
+# workbuddy2api（:7863，持上游 api_key）绕过网关，网关一行都记不到 —— 统计页
+# 于是恒为 0，即便上游确实在跑大量真实流量。usage_health 也检测不出：它的判据是
+# 「今天有请求日志但用量为 0」，而直连场景下**请求日志本身也是 0**。
+#
+# 上游 workbuddy2api 自己按模型累计了真实用量（GET /v1/stats，累计自其启动）。
+# 这里在「本管理端从未计量到任何流量」时把它取回来兜底，让统计页反映真实用量，
+# 而不是一片 0。**只在本地完全无计量时兜底**（见 `_has_local_usage`）：一旦网关
+# 记到过流量就以本地为准，避免与直连的上游累计重复计数。
+#
+# 与 `/api/stats/upstream`（issue #59）的分工：那个端点把上游统计**单独并列**摆出来，
+# 明确标注口径不同；这里的兜底是当网关侧为 0 时让**页头卡片与图表**不至于说谎。
+# 两者读同一个上游接口，一个「并列展示」、一个「缺省替换」，互不冲突。
+#
+# 为什么是同步 httpx 而不是复用 wb2api.get_upstream_stats()：本模块的统计端点都是
+# 同步 def（既有测试直接同步调用它们，见 test_stats_failures.py），无法 await 那个
+# 协程。这里只是一次只读旁路请求，单独一个同步客户端最简单，也不必把同步端点染成
+# async。
+_UPSTREAM_TTL = 30.0
+_upstream_cache: dict = {'at': 0.0, 'data': None}
+
+
+def _fetch_upstream_stats() -> dict | None:
+    """拉取 workbuddy2api 的 /v1/stats（真实累计用量）。失败或未启用返回 None。
+
+    30 秒缓存：一次页面刷新会连着调 summary / daily / hourly / by-model / by-key
+    五个接口，缓存避免每个都打一次上游。鉴权与 /status 同源（上游 api_key）。
+    """
+    now = time.time()
+    if _upstream_cache['data'] is not None and now - float(_upstream_cache['at']) < _UPSTREAM_TTL:
+        return _upstream_cache['data']
+    try:
+        headers = {}
+        key = config.upstream_api_key()
+        if key:
+            headers['Authorization'] = f'Bearer {key}'
+        # trust_env=False：与 config.http_client 同口径，不走系统代理（上游多在同机/
+        # 同网络，交给系统代理反而会被劫持）。这里也**不**读 WB_HTTP_PROXY —— 那是给
+        # 「本服务主动访问外网」用的，访问本地上游不该经过它。
+        with httpx.Client(timeout=httpx.Timeout(8, connect=3), trust_env=False) as client:
+            resp = client.get(f'{config.WB2API_BASE}/v1/stats', headers=headers)
+        if resp.status_code >= 400:
+            return None
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+    except Exception as exc:  # noqa: BLE001
+        # 兜底属旁路：上游不可达时统计页照常显示（本地口径的 0），不报错
+        logger.debug('拉取上游 /v1/stats 失败（不影响统计页）: %s', exc)
+        return None
+    _upstream_cache['at'] = now
+    _upstream_cache['data'] = data
+    return data
+
+
+def _has_local_usage(realm: str | None) -> bool:
+    """本地网关是否记到过**任何**流量（用量 或 请求日志）。
+
+    兜底的开关：只有本地一行都没有时才去取上游累计，避免与网关自己的计量重复
+    计数。**必须同时看 request_logs**：只看 usage_daily 的话，「只有失败请求」
+    （403 / 429 / 503 这些零 token 的调用不进用量表）会被误判成「网关没被用过」，
+    于是回退把失败数也覆盖掉——那不是回退，是抹掉现场。
+    realm 为空按全表判断。request_logs 的 realm 列可能是历史 NULL（后加的列），
+    与 `_failures` 同口径按 cn 归类。
+    """
+    if realm in ('cn', 'global'):
+        uargs: tuple = (realm,)
+        if db.query_one('SELECT 1 AS x FROM usage_daily WHERE realm = ? LIMIT 1', uargs) is not None:
+            return True
+        return db.query_one(
+            "SELECT 1 AS x FROM request_logs WHERE COALESCE(realm, 'cn') = ? LIMIT 1",
+            uargs,
+        ) is not None
+    if db.query_one('SELECT 1 AS x FROM usage_daily LIMIT 1') is not None:
+        return True
+    return db.query_one('SELECT 1 AS x FROM request_logs LIMIT 1') is not None
+
+
+def _upstream_models(data: dict, realm: str | None) -> list[dict]:
+    """上游 /v1/stats 的 models[]，按 realm（模型名前缀）过滤。
+
+    上游模型名带 `cn:` / `global:` 前缀（其路由协议），与本端 realm_of_model 同口径；
+    无前缀者归 cn。realm 为空不过滤。
+    """
+    models = data.get('models')
+    if not isinstance(models, list):
+        return []
+    out: list[dict] = []
+    for m in models:
+        if not isinstance(m, dict) or not m.get('model'):
+            continue
+        if realm in ('cn', 'global') and db.realm_of_model(str(m.get('model'))) != realm:
+            continue
+        out.append(m)
+    return out
+
+
+def _agg_upstream(models: list[dict]) -> tuple[int, int, int, float]:
+    """聚合上游模型明细：返回 (requests, prompt_tokens, completion_tokens, credit)。"""
+    req = pt = ct = 0
+    credit = 0.0
+    for m in models:
+        req += int(m.get('requests') or 0)
+        pt += int(m.get('prompt_tokens') or 0)
+        ct += int(m.get('completion_tokens') or 0)
+        credit += float(m.get('credit') or 0)
+    return req, pt, ct, credit
 
 
 # days 的取值范围。**必须有上限**：超大整数在 SQLite 绑定时溢出抛错
@@ -89,6 +205,44 @@ def summary(realm: str | None = None,
         f'FROM usage_daily WHERE 1=1{rf} GROUP BY model ORDER BY score DESC LIMIT 1',
         rargs,
     )
+    top_model = top['model'] if top else None
+    health = _usage_health(today, t_req, realm)
+
+    # 本地网关从未计量到任何流量 → 回落到上游真实累计用量（客户端直连 :7863
+    # 绕过了管理端网关）。**只在本地完全无计量时**回落，避免与网关自己的计量重复。
+    upstream = None
+    if not _has_local_usage(realm):
+        raw = _fetch_upstream_stats()
+        if raw:
+            models = _upstream_models(raw, realm)
+            u_req, u_pt, u_ct, u_credit = _agg_upstream(models)
+            if u_req > 0:
+                u_tok = u_pt + u_ct
+                since = str(raw.get('since') or '')[:19]
+                upstream = {
+                    'requests': u_req, 'tokens': u_tok, 'credit': u_credit,
+                    'since': raw.get('since'), 'now': raw.get('now'),
+                    'uptime_sec': raw.get('uptime_sec'),
+                }
+                # 上游统计是「自启动以来累计」，无法拆分到具体某天；因此今日/本周/总量
+                # 三个口径都填同一份累计值，并在下方横幅里明确披露这一点。
+                t_req = w_req = a_req = u_req
+                t_tok = w_tok = a_tok = u_tok
+                t_credit = w_credit = a_credit = u_credit
+                topm = max(models, key=lambda m: int(m.get('requests') or 0), default=None)
+                if topm:
+                    top_model = str(topm.get('model') or '') or top_model
+                # 把真实的头部数字直接摆进告警横幅，并说清为什么网关侧为 0。
+                health = {
+                    'ok': False,
+                    'logs_today': 0,
+                    'detail': (
+                        f'管理端网关未计量到任何请求：客户端可能直连 workbuddy2api（:7863）'
+                        f'绕过了网关。以下数字来自上游真实累计用量'
+                        f'（自 {since} 起）：{u_req} 次请求、{u_tok} tokens、扣费 {u_credit:.2f}。'
+                        f'若需按天/按密钥的精细统计，请让客户端改用管理端网关地址与网关密钥。'
+                    ),
+                }
     return {
         'today_requests': t_req,
         'today_tokens': t_tok,
@@ -101,9 +255,12 @@ def summary(realm: str | None = None,
         'total_requests': a_req,
         'total_tokens': a_tok,
         'active_keys': int(active_keys),
-        'top_model': top['model'] if top else None,
-        'usage_health': _usage_health(today, t_req, realm),
+        'top_model': top_model,
+        'usage_health': health,
         'failures': _failures(realm),
+        # 上游真实累计用量（仅当本地无计量、且上游有数据时非空）。
+        # 旧前端忽略未知字段，新字段不影响已有展示。
+        'upstream': upstream,
     }
 
 
@@ -283,6 +440,19 @@ def daily(days: int = 30, realm: str | None = None,
                 'completion_tokens': 0, 'credit': 0.0, 'failed': n,
             })
     out.sort(key=lambda d: d['day'])
+    # 本地无任何用量 → 用上游真实累计填一个「今日」点，使趋势图与卡片一致
+    # （上游无法拆分到具体某天，语义由 summary 的告警横幅统一披露）。
+    if not out and not _has_local_usage(realm):
+        raw = _fetch_upstream_stats()
+        if raw:
+            models = _upstream_models(raw, realm)
+            u_req, u_pt, u_ct, u_credit = _agg_upstream(models)
+            if u_req > 0:
+                out = [{
+                    'day': time.strftime('%Y-%m-%d'),
+                    'requests': u_req, 'prompt_tokens': u_pt,
+                    'completion_tokens': u_ct, 'credit': u_credit, 'failed': 0,
+                }]
     return out
 
 
@@ -349,6 +519,21 @@ def hourly(day: str | None = None, realm: str | None = None,
             'credit': float(r['credit'] or 0) if r else 0.0,
             'failed': failures.get(h, 0),
         })
+    # 本地无任何用量 → 把上游真实累计放进「当前小时」这一个桶，使「今日趋势」图
+    # 与页头卡片一致。上游无法把自启动累计拆分到具体某小时，语义由 summary 的
+    # 告警横幅统一披露（只打当前小时的柱子，不伪造其余时段）。
+    if not any(p['requests'] for p in out) and not _has_local_usage(realm):
+        raw = _fetch_upstream_stats()
+        if raw:
+            models = _upstream_models(raw, realm)
+            u_req, u_pt, u_ct, u_credit = _agg_upstream(models)
+            if u_req > 0:
+                h = time.localtime().tm_hour
+                out[h] = {
+                    'day': d, 'hour': h,
+                    'requests': u_req, 'prompt_tokens': u_pt,
+                    'completion_tokens': u_ct, 'credit': u_credit, 'failed': 0,
+                }
     return out
 
 
@@ -387,6 +572,26 @@ def by_model(days: int = 30, realm: str | None = None,
         f'FROM usage_daily WHERE day >= ?{rf} GROUP BY model ORDER BY SUM(prompt_tokens + completion_tokens) DESC',
         args,
     )
+    if not rows and not _has_local_usage(realm):
+        # 本地无计量 → 直接展示上游真实的按模型累计用量
+        raw = _fetch_upstream_stats()
+        if raw:
+            models = _upstream_models(raw, realm)
+            models.sort(
+                key=lambda m: int(m.get('prompt_tokens') or 0) + int(m.get('completion_tokens') or 0),
+                reverse=True,
+            )
+            if models:
+                return [
+                    {
+                        'name': str(m.get('model') or '未知'),
+                        'requests': int(m.get('requests') or 0),
+                        'prompt_tokens': int(m.get('prompt_tokens') or 0),
+                        'completion_tokens': int(m.get('completion_tokens') or 0),
+                        'credit': float(m.get('credit') or 0),
+                    }
+                    for m in models
+                ]
     return [
         {
             'name': r['name'] or '未知',
@@ -418,6 +623,18 @@ def by_key(days: int = 30, realm: str | None = None,
         f'WHERE u.day >= ?{rf} GROUP BY u.key_id ORDER BY SUM(u.prompt_tokens + u.completion_tokens) DESC',
         args,
     )
+    if not rows and not _has_local_usage(realm):
+        # 本地无计量 → 直连流量不携带网关密钥，无法按密钥拆分，用一行如实标注。
+        raw = _fetch_upstream_stats()
+        if raw:
+            models = _upstream_models(raw, realm)
+            u_req, u_pt, u_ct, u_credit = _agg_upstream(models)
+            if u_req > 0:
+                return [{
+                    'name': '直连流量（绕过网关，无法按密钥拆分）',
+                    'requests': u_req, 'prompt_tokens': u_pt,
+                    'completion_tokens': u_ct, 'credit': u_credit,
+                }]
     return [
         {
             'name': r['name'] or '未知',
